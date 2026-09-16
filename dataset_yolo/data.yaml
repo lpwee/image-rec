@@ -1,4 +1,4 @@
-path: /Users/pingw/projects/SC2079-MULTIDISCIPLINARY-DES-PROJ/image-rec/dataset_yolo
+path: /workspace/image-rec/dataset_yolo
 train: images/train
 val: images/val
 
@@ -12,8 +12,8 @@ names:
   6: "17_7"
   7: "18_8"
   8: "19_9"
-  9: "20_A"
-  10: "21_B"
+  9: "20"
+  10: "21"
   11: "22"
   12: "23"
   13: "24"

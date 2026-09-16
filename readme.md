@@ -27,6 +27,13 @@ I have this idea in my head, that we can train a model to recognise and detect t
 - Image polling rate?
 
 
+## Split
+```py
+python3 split_dataset.py            # 80/20 per class, seed 42
+```
+Pools every capture in `dataset/train` + `dataset/test` and re-splits them per class (stratified).
+`dataset/junk/` holds captures with no card in them (group photo, hand, corrupted frame); nothing reads it.
+
 ## Autolabel
 ```py
 python3 autolabel.py
@@ -34,4 +41,11 @@ python3 autolabel.py
 ```
 Converts ImageFolder `dataset/` (ResNet-18's standard) to `dataset_yolo` (Ultralytics' Standard).
 This is done by keeping the identified labels (from photobooth) and draw bounding boxes (using opencv).
+The card is found as a square bright blob with a centred dark symbol, sitting on the dark obstacle face
+(thresholded globally and locally inside each dark blob). Images with no plausible card are skipped and listed.
+Check `dataset_yolo/review/` after running.
+
+## Train
+- `train.ipynb` - YOLO26n **detector** (box + class) on `dataset_yolo/`. Needs autolabel.
+- `train_cls.ipynb` - YOLO26n-cls **classifier** (class only) straight from `dataset/`. No autolabel needed.
 

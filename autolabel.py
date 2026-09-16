@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """Auto-label SC2079 symbol-card images with YOLO bounding boxes.
 
-Detection is classical CV: the symbol card is a bright (white) region with a
-high-contrast symbol inside. We find it with Otsu thresholding + contours, and
-fall back to boxing the dark symbol blob directly when the card outline can't
-be isolated (e.g. card fills the frame or blends into a bright background).
+Detection is classical CV. The card is a square-ish bright region with a
+high-contrast symbol inside, sitting on the dark face of the obstacle. Candidate
+blobs come from two sources: global thresholds (card brighter than everything),
+and "box first" (threshold locally inside each large dark blob, for dim scenes
+where the card is only bright relative to the obstacle). Candidates are then
+filtered on shape and scored on how well the left/right/bottom surround is dark
+and whether the symbol sits centered inside. There is no fallback box: an image
+with no plausible card is reported as failed and left out of the dataset.
 
 Class indices are fixed as ``image_id - 11`` (IDs 11-40 -> indices 0-29), so
 labels stay consistent between photobooth sidecars and this converter.
@@ -39,74 +43,161 @@ import numpy as np
 CLASS_ID_BASE = 11  # image ID 11 -> class index 0
 CLASS_DIR_RE = re.compile(r"^(\d+)_(.+)$")
 IMAGE_EXTS = {".jpg", ".jpeg", ".png"}
-PAD_FRAC = 0.03  # padding added around the detected card, per side
 
-# candidate filters, as fractions of the frame
-MIN_AREA_FRAC = 0.002
-MAX_AREA_FRAC = 0.9
-MIN_ASPECT, MAX_ASPECT = 0.25, 4.0
-MIN_SOLIDITY = 0.7  # contour area / min-area-rect area: cards are rectangular
-MIN_CONTRAST = 60
-# a single global Otsu threshold merges the card into other bright regions in
-# busy scenes, so sweep fixed levels too and let scoring pick the best blob
-THRESHOLDS = (150, 180, 210)
+PAD_FRAC = 0.03
+MIN_AREA_FRAC, MAX_AREA_FRAC = 0.002, 0.85
+MIN_ASPECT, MAX_ASPECT = 0.5, 2.0
+MIN_SOLIDITY = 0.75
+MIN_FILL = 0.6
+MIN_CONTRAST = 50
+THRESHOLDS = (120, 150, 180, 210)
+SIDE_FRAC = 0.25
+SIDE_DARK = 95
+MIN_SIDE_COVER = 0.4
+DARK_FACE = 70          # obstacle faces / the stop card are below this gray level
+MIN_FACE_FRAC = 0.01    # dark blob must cover at least this much of the frame
 
 
-def detect_card(image):
+def _side_score(blur, x, y, w, h):
+    H, W = blur.shape
+    bw, bh = max(2, int(w * SIDE_FRAC)), max(2, int(h * SIDE_FRAC))
+    bands = [(x - bw, y, x, y + h), (x + w, y, x + w + bw, y + h), (x, y + h, x + w, y + h + bh)]
+    dark = usable = 0
+    for x0, y0, x1, y1 in bands:
+        full = (x1 - x0) * (y1 - y0)
+        cx0, cy0, cx1, cy1 = max(0, x0), max(0, y0), min(W, x1), min(H, y1)
+        if cx1 <= cx0 or cy1 <= cy0 or (cx1 - cx0) * (cy1 - cy0) < MIN_SIDE_COVER * full:
+            continue
+        usable += 1
+        dark += blur[cy0:cy1, cx0:cx1].mean() < SIDE_DARK
+    return dark, usable
+
+
+def _symbol_centered(roi_dark):
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(roi_dark.astype(np.uint8), 8)
+    if n <= 1:
+        return False
+    i = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    x, y, w, h = stats[i, :4]
+    return x > 0 and y > 0 and x + w < roi_dark.shape[1] and y + h < roi_dark.shape[0]
+
+
+def _masks(blur_crop, edges_crop, thresholds):
+    """Yield candidate bright masks for a (cropped) frame at several thresholds."""
+    for t in thresholds:
+        _, bright = cv2.threshold(blur_crop, t, 255, cv2.THRESH_BINARY)
+        cut = bright.copy()
+        cut[edges_crop > 0] = 0
+        yield cv2.morphologyEx(cut, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        yield cv2.morphologyEx(bright, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+
+
+class _Scorer:
+    """Filters and scores candidate contours; keeps the best (score, (x, y, w, h))."""
+
+    def __init__(self, blur):
+        self.blur = blur
+        self.H, self.W = blur.shape
+        self.frame_area = self.W * self.H
+        self.seen = set()
+        self.best = None
+        self.debug = None
+
+    def consider(self, contour, ox=0, oy=0, min_contrast=MIN_CONTRAST, strict_sides=True, min_dark=0.04):
+        blur, W, H = self.blur, self.W, self.H
+        area = cv2.contourArea(contour)
+        if not MIN_AREA_FRAC * self.frame_area < area < MAX_AREA_FRAC * self.frame_area:
+            return
+        x, y, w, h = cv2.boundingRect(contour)
+        x, y = x + ox, y + oy
+        if not MIN_ASPECT < w / h < MAX_ASPECT:
+            return
+        if x <= 2 and x + w >= W - 2:
+            return
+        key = (x // 6, y // 6, w // 6, h // 6)
+        if key in self.seen:
+            return
+        self.seen.add(key)
+        rect_area = np.prod(cv2.minAreaRect(contour)[1])
+        solidity = area / rect_area if rect_area else 0
+        if solidity < MIN_SOLIDITY or area / (w * h) < MIN_FILL:
+            return
+        sx, sy = int(w * 0.1), int(h * 0.1)
+        roi = blur[y + sy : y + h - sy, x + sx : x + w - sx]
+        if roi.size < 50:
+            return
+        lo, hi = np.percentile(roi, [5, 95])
+        if hi - lo < min_contrast:
+            return
+        roi_dark = roi < (lo + hi) / 2
+        dark_frac = float(roi_dark.mean())
+        if not min_dark <= dark_frac < 0.92:
+            return
+        dark_sides, usable = _side_score(blur, x, y, w, h)
+        if usable >= 2 and dark_sides == 0:
+            return
+        if strict_sides and usable and dark_sides < (usable + 1) // 2:
+            return  # a real card has the dark obstacle face on its left/right
+        # agreement of the usable bands, discounted when few bands could be checked
+        side_factor = (0.5 + 0.5 * dark_sides / usable) * (0.6 + 0.4 * usable / 3) if usable else 0.5
+        centered = 1.0 if _symbol_centered(roi_dark) else 0.5
+        squareness = min(w, h) / max(w, h)
+        size = min(area / self.frame_area, 0.1) ** 0.25  # prefer the larger of two valid cards, up to 10% of the frame
+        glare = 1.0 if hi - lo >= MIN_CONTRAST else 0.5
+        score = solidity * squareness * side_factor * centered * size * glare
+        if self.debug is not None:
+            self.debug.append((round(float(score), 3), (x, y, w, h), round(solidity, 2), round(dark_frac, 2), f'{dark_sides}/{usable}', centered, round(float(hi - lo))))
+        if self.best is None or score > self.best[0]:
+            self.best = (score, (x, y, w, h))
+
+
+def detect_card(image, debug=None):
     """Find the symbol card in a BGR image.
 
-    Returns ((cx, cy, w, h), method) with YOLO-normalized coords, where method
-    is "card" (white card outline) or "symbol" (fallback: dark symbol blob),
-    or None if nothing plausible was found.
+    Returns ((cx, cy, w, h), "card") with YOLO-normalized coords, or None when
+    no plausible card was found (junk frame, motion blur, card cut off). Pass a
+    list as ``debug`` to collect every scored candidate.
     """
-    frame_h, frame_w = image.shape[:2]
-    frame_area = frame_w * frame_h
+    H, W = image.shape[:2]
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
-
+    edges = cv2.dilate(cv2.Canny(blur, 50, 150), np.ones((3, 3), np.uint8))
     otsu, _ = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    best = None  # (score, (x, y, w, h))
-    for threshold in {int(otsu), *THRESHOLDS}:
-        _, bright = cv2.threshold(blur, threshold, 255, cv2.THRESH_BINARY)
-        bright = cv2.morphologyEx(bright, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
-        contours, _ = cv2.findContours(bright, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for contour in contours:
-            area = cv2.contourArea(contour)
-            if not MIN_AREA_FRAC * frame_area < area < MAX_AREA_FRAC * frame_area:
-                continue
-            x, y, w, h = cv2.boundingRect(contour)
-            if not MIN_ASPECT < w / h < MAX_ASPECT:
-                continue
-            rect_area = np.prod(cv2.minAreaRect(contour)[1])
-            solidity = area / rect_area if rect_area else 0
-            if solidity < MIN_SOLIDITY:
-                continue
-            roi = blur[y : y + h, x : x + w]
-            lo, hi = np.percentile(roi, [5, 95])
-            if hi - lo < MIN_CONTRAST:  # no high-contrast symbol inside
-                continue
-            dark_frac = np.mean(roi < (lo + hi) / 2)
-            if not 0.03 < dark_frac < 0.55:
-                continue
-            score = solidity * np.sqrt(area / frame_area)
-            if best is None or score > best[0]:
-                best = (score, (x, y, w, h))
-    if best is not None:
-        return _normalized_box(*best[1], frame_w, frame_h, PAD_FRAC), "card"
+    scorer = _Scorer(blur)
+    scorer.debug = debug
 
-    # fallback: box the dark symbol directly and pad generously toward card size
-    _, dark = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    dark = cv2.morphologyEx(dark, cv2.MORPH_CLOSE, np.ones((11, 11), np.uint8))
-    contours, _ = cv2.findContours(dark, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    candidates = [
-        cv2.boundingRect(c)
-        for c in contours
-        if 0.002 * frame_area < cv2.contourArea(c) < 0.5 * frame_area
-    ]
-    if not candidates:
-        return None
-    x, y, w, h = max(candidates, key=lambda r: r[2] * r[3])
-    return _normalized_box(x, y, w, h, frame_w, frame_h, pad=0.15), "symbol"
+    # 1. global thresholds: works when the card is the brightest thing around
+    for mask in _masks(blur, edges, sorted({int(otsu), *THRESHOLDS})):
+        for c in cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]:
+            scorer.consider(c, min_contrast=20, min_dark=0.0)
+
+    # 2. box first: the card is only bright *relative to* the dark obstacle face it
+    #    sits on, so threshold locally inside each large dark blob's bounding box
+    _, dark = cv2.threshold(blur, DARK_FACE, 255, cv2.THRESH_BINARY_INV)
+    dark = cv2.morphologyEx(dark, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+    for c in cv2.findContours(dark, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]:
+        if cv2.contourArea(c) < MIN_FACE_FRAC * W * H:
+            continue
+        bx, by, bw, bh = cv2.boundingRect(c)
+        m = max(4, int(0.05 * max(bw, bh)))
+        x0, y0, x1, y1 = max(0, bx - m), max(0, by - m), min(W, bx + bw + m), min(H, by + bh + m)
+        crop = blur[y0:y1, x0:x1]
+        if crop.size < 400:
+            continue
+        hull = np.zeros_like(crop)
+        cv2.fillConvexPoly(hull, cv2.convexHull(c) - (x0, y0), 255)
+        inside = crop[hull > 0]
+        local_otsu, _ = cv2.threshold(inside, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        levels = sorted({int(local_otsu), int(local_otsu * 0.8), int(local_otsu * 1.2)})
+        for mask in _masks(crop, edges[y0:y1, x0:x1], levels):
+            mask[hull == 0] = 0
+            for cc in cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]:
+                scorer.consider(cc, x0, y0, min_contrast=20, strict_sides=False, min_dark=0.0)
+
+    if scorer.best is not None:
+        return _normalized_box(*scorer.best[1], W, H, PAD_FRAC), "card"
+
+    return None
 
 
 def _normalized_box(x, y, w, h, frame_w, frame_h, pad):
@@ -153,7 +244,7 @@ def draw_review(image, box, caption, method):
         y0 = int((cy - h / 2) * frame_h)
         x1 = int((cx + w / 2) * frame_w)
         y1 = int((cy + h / 2) * frame_h)
-        color = (0, 200, 0) if method == "card" else (0, 165, 255)
+        color = (0, 200, 0) if method == "card" else (0, 165, 255)  # orange = photobooth sidecar
         cv2.rectangle(out, (x0, y0), (x1, y1), color, 2)
         cv2.putText(out, caption, (x0, max(20, y0 - 8)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
@@ -181,7 +272,7 @@ def convert_split(src_split, out_dir, split_name, names, force, review, failures
     for d in (images_dir, labels_dir) + ((review_dir,) if review else ()):
         d.mkdir(parents=True, exist_ok=True)
 
-    stats = {"labeled": 0, "sidecar": 0, "fallback": 0, "skipped": 0, "failed": 0}
+    stats = {"labeled": 0, "sidecar": 0, "skipped": 0, "failed": 0}
     for class_dir in sorted(p for p in src_split.iterdir() if p.is_dir()):
         match = CLASS_DIR_RE.match(class_dir.name)
         if not match:
@@ -221,8 +312,6 @@ def convert_split(src_split, out_dir, split_name, names, force, review, failures
                     continue
                 box, method = result
                 class_index_used = class_index
-                if method == "symbol":
-                    stats["fallback"] += 1
 
             label_path.write_text(format_label(class_index_used, box))
             if not out_image.exists() or force:
@@ -280,8 +369,7 @@ def main():
         print(f"{src_name}/ -> {split_name}/")
         stats = convert_split(src_split, args.out, split_name, names,
                               args.force, args.review, failures)
-        print(f"  labeled {stats['labeled']}"
-              f" (sidecar {stats['sidecar']}, fallback-box {stats['fallback']})"
+        print(f"  labeled {stats['labeled']} (sidecar {stats['sidecar']})"
               f", skipped {stats['skipped']}, failed {stats['failed']}")
     if not any_split:
         print(f"No train/ or test/ under {args.dataset}", file=sys.stderr)
